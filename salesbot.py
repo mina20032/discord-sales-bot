@@ -5,6 +5,7 @@ Discord bot: يبحث عن شركات (برمجة/ماركتنج/إيكومرس/
 
 * تم استبدال Serper.dev بـ DuckDuckGo (DDGS sync داخل thread).
 * قراءة القيم الحساسة من Environment Variables (بدون أسرار في الكود).
+* إضافة تحقق متعدد المراحل + درجة ثقة لرفع جودة النتائج.
 """
 
 import os
@@ -12,6 +13,7 @@ import re, csv, io, asyncio
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime
+from urllib.parse import urljoin
 
 from dotenv import load_dotenv
 load_dotenv()  # يقرأ من ملف .env محليًا (لو موجود)
@@ -36,6 +38,9 @@ GUILD_ID = int(GUILD_ID_ENV) if GUILD_ID_ENV.isdigit() else None
 DEFAULT_CITY = os.getenv("DEFAULT_CITY", "الغربية").strip()
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
 DEFAULT_PER_GOV_WHEN_ALL = int(os.getenv("DEFAULT_PER_GOV_WHEN_ALL", "5"))
+
+# حدّ الثقة الأدنى للقبول (عدّله لو عايز تشدد/تلين)
+CONF_THRESHOLD = int(os.getenv("CONF_THRESHOLD", "70"))
 
 # =========================
 # التصنيفات + عبارات البحث
@@ -81,9 +86,8 @@ HEADERS = {
 # Discord bot bootstrap
 # =========================
 intents = discord.Intents.default()
-# لو هتحتاج قراءة محتوى الرسائل ارفع الـ intent اللي تحت وفعل Message Content من البورتال:
+# لو هتحتاج قراءة محتوى الرسائل فعّل اللي تحت وكمان Message Content من البورتال:
 # intents.message_content = True
-
 BOT = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
@@ -99,6 +103,7 @@ class Company:
     city: Optional[str]
     category: str
     snippet: Optional[str]
+    score: int = 0  # درجة الثقة
 
 def trim(text: Optional[str], limit: int) -> str:
     if not text:
@@ -135,6 +140,55 @@ def domain_of(url: str) -> str:
     if not ext.domain:
         return ""
     return f"{ext.domain}.{ext.suffix}" if ext.suffix else ext.domain
+
+# كلمات بنحاول نلاقي بيها صفحة التواصل
+AR_CONTACT_WORDS = ["اتصل", "اتصل بنا", "تواصل", "تواصل معنا", "راسلنا", "الدعم"]
+EN_CONTACT_WORDS = ["contact", "support", "get in touch"]
+
+def same_domain(email: Optional[str], site_url: Optional[str]) -> bool:
+    if not email or not site_url:
+        return False
+    try:
+        em_dom = email.split("@", 1)[1].strip().lower()
+        em_dom = tldextract.extract(em_dom)
+        em_dom = f"{em_dom.domain}.{em_dom.suffix}" if em_dom.suffix else em_dom.domain
+        si_dom = tldextract.extract(site_url)
+        si_dom = f"{si_dom.domain}.{si_dom.suffix}" if si_dom.suffix else si_dom.domain
+        return em_dom and si_dom and (em_dom == si_dom)
+    except Exception:
+        return False
+
+def find_contact_links(soup: BeautifulSoup, base: str) -> List[str]:
+    links = []
+    for a in soup.find_all("a", href=True):
+        text = (a.get_text() or "").strip().lower()
+        href = a["href"]
+        if any(w in text for w in [*AR_CONTACT_WORDS, *EN_CONTACT_WORDS]):
+            links.append(urljoin(base, href))
+    # fallback بسيط
+    links.append(urljoin(base, "/contact"))
+    return list(dict.fromkeys(links))[:3]
+
+def compute_confidence(page_text: str, title: str, company: Company, category_key: str) -> int:
+    text = (title + "\n" + page_text).lower()
+    score = 0
+    # وجود وسيلة تواصل
+    if company.phone: score += 35
+    if company.email: score += 20
+    if same_domain(company.email, company.website): score += 10
+    # مدينة/مصر
+    if company.city and company.city != "كل المحافظات": score += 10
+    if "مصر" in text or "egypt" in text: score += 5
+    # تطابق كلمات التصنيف
+    kws = [q.lower() for q in CATEGORIES[category_key]["queries"]]
+    if any(k in text for k in kws): score += 15
+    # دومين .eg مكافأة صغيرة
+    try:
+        ext = tldextract.extract(company.website or "")
+        if ext.suffix == "eg": score += 5
+    except Exception:
+        pass
+    return max(0, min(100, score))
 
 # =========================
 # DuckDuckGo Search
@@ -179,11 +233,13 @@ async def fetch_html(session: aiohttp.ClientSession, url: str) -> Tuple[str, str
     except Exception:
         return "", ""
 
-def parse_company_from_html(html: str, resolved_url: str, base_name: Optional[str], category_key: str, snippet: Optional[str], place_label: str) -> Company:
+def parse_company_from_html(html: str, resolved_url: str, base_name: Optional[str],
+                            category_key: str, snippet: Optional[str], place_label: str) -> Company:
     soup = BeautifulSoup(html, "html.parser")
     title = soup.title.string.strip() if soup.title and soup.title.string else (base_name or "Unknown")
     title = clean_title(title)
 
+    # نص الصفحة المرئي
     visible_text_parts = []
     for tag in soup.find_all(string=True):
         if getattr(tag, "parent", None) and tag.parent.name in ["script", "style", "noscript"]:
@@ -197,10 +253,9 @@ def parse_company_from_html(html: str, resolved_url: str, base_name: Optional[st
     emails = extract_emails(full_text)
     socials = [a.get("href") for a in soup.find_all("a", href=True) if looks_like_social(a["href"])]
     socials = list(dict.fromkeys(socials))[:5]
-
     city = guess_city_from_text(full_text) or guess_city_from_text(snippet or "") or place_label
 
-    return Company(
+    comp = Company(
         name=title,
         website=resolved_url,
         phone=phone,
@@ -210,6 +265,10 @@ def parse_company_from_html(html: str, resolved_url: str, base_name: Optional[st
         category=CATEGORIES[category_key]["ar"],
         snippet=snippet[:180] if snippet else None
     )
+
+    # درجة الثقة الأولية
+    comp.score = compute_confidence(full_text, title, comp, category_key)
+    return comp
 
 # =========================
 # البروسس الأساسية
@@ -242,9 +301,38 @@ async def gather_companies_for_place(category_key: str, place_label: str, limit:
             html, final_url = await fetch_html(session, hit["link"])
             if not html:
                 continue
+
+            # Parse أساسي
             comp = parse_company_from_html(html, final_url, hit.get("title"), category_key, hit.get("snippet"), place_label)
+
+            # زيادة الدقة: تجربة أول صفحة Contact إن لزم
+            try:
+                if comp.website and (not comp.phone or not comp.email):
+                    soup = BeautifulSoup(html, "html.parser")
+                    contact_links = find_contact_links(soup, comp.website)
+                    for cl in contact_links:
+                        ch_html, ch_url = await fetch_html(session, cl)
+                        if not ch_html:
+                            continue
+                        ch_soup = BeautifulSoup(ch_html, "html.parser")
+                        text = ch_soup.get_text(" ", strip=True)
+                        comp.phone = comp.phone or normalize_phone(text)
+                        ems = extract_emails(text)
+                        if ems and not comp.email:
+                            comp.email = ems[0]
+                        # إعادة احتساب الثقة بعد صفحة التواصل
+                        comp.score = compute_confidence(text, comp.name, comp, category_key)
+                        if comp.phone or comp.email:
+                            break
+            except Exception:
+                pass
+
+            # فلترة: لازم يحقق حد الثقة + على الأقل وسيلة تواصل أو سوشيال
+            if comp.score < CONF_THRESHOLD:
+                continue
             if not (comp.phone or comp.email or comp.socials):
                 continue
+
             results.append(comp)
             if len(results) >= limit:
                 break
@@ -255,11 +343,11 @@ async def gather_companies_for_place(category_key: str, place_label: str, limit:
 def to_csv_bytes(items: List[Company]) -> bytes:
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["Name", "City", "Category", "Website", "Phone", "Email", "Socials", "Snippet"])
+    writer.writerow(["Name", "City", "Category", "Website", "Phone", "Email", "Socials", "Snippet", "Confidence"])
     for c in items:
         writer.writerow([
             c.name, c.city, c.category, c.website or "", c.phone or "", c.email or "",
-            " | ".join(c.socials) if c.socials else "", c.snippet or ""
+            " | ".join(c.socials) if c.socials else "", c.snippet or "", c.score
         ])
     return buf.getvalue().encode("utf-8-sig")
 
@@ -273,6 +361,7 @@ def company_to_embed(c: Company) -> discord.Embed:
     )
     em.add_field(name="📍 المحافظة/المدينة", value=trim(c.city or "—", 256), inline=True)
     em.add_field(name="🏷️ التصنيف", value=trim(c.category, 256), inline=True)
+    em.add_field(name="✅ الثقة", value=f"{c.score}%", inline=True)
     if c.phone:
         em.add_field(name="☎️ التليفون", value=trim(f"`{c.phone}`", 1024), inline=False)
     if c.email:
